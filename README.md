@@ -27,6 +27,8 @@ Core button semantics are **unchanged** from v1.0.0.
 
 Any future release that alters button behaviour will require a **major version bump** and explicit justification.
 
+See CHANGELOG.md for the full change history.
+
 ---
 
 ## Why this driver exists
