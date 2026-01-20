@@ -1,7 +1,7 @@
 /**
  *  Tuya TS0044 4-Button Zigbee Scene Switch (Reliable)
  *
- *  VERSION: 1.0.0  (FROZEN)
+ *  VERSION: 1.1.0  (ENHANCEMENTS)
  *
  *  STATUS:
  *   - Production-ready
@@ -44,9 +44,11 @@
  *   - Prefer explicit device signals over inference
  *
  *  CHANGE CONTROL:
- *   - v1.0 is a freeze of v0.5 behaviour
- *   - Any future changes should increment MAJOR version
- *     and be justified by real-world evidence
+ *   - v1.0.0 was the initial long-term "frozen" baseline
+ *   - v1.1.0 adds factual health/diagnostic attributes (for SiMon/BatMan) and
+ *     human-centric UI attributes, without changing the core button semantics
+ *   - Any future behaviour-changing updates should increment MAJOR version and
+ *     be justified by real-world evidence
  *
  *  Author: E.M.Chavits
  *  Based on empirical testing of _TZ3000_wkai4ga5 / TS0044
@@ -56,7 +58,7 @@ import groovy.transform.Field
 import hubitat.zigbee.zcl.DataType
 
 @Field static final String DRIVER_NAME = "Tuya TS0044 4-Button Scene Switch (Reliable)"
-@Field static final String DRIVER_VER  = "1.0.0"
+@Field static final String DRIVER_VER  = "1.1.0"
 
 @Field static final Integer BUTTON_COUNT = 4
 
@@ -72,29 +74,57 @@ import hubitat.zigbee.zcl.DataType
 
 metadata {
     definition(
-        name: DRIVER_NAME, 
-        namespace: "EMC", 
+        name: DRIVER_NAME,
+        namespace: "EMC",
         author: "E.M.Chavits"
-        ) {
-            capability "Actuator"
-            capability "PushableButton"
-            capability "HoldableButton"
-            capability "ReleasableButton"
-            capability "DoubleTapableButton"
-            capability "Configuration"
-            capability "Refresh"
-            capability "Initialize"
-            capability "Battery"
-            capability "SignalStrength"
+    ) {
+        capability "Actuator"
+        capability "PushableButton"
+        capability "HoldableButton"
+        capability "ReleasableButton"
+        capability "DoubleTapableButton"
+        capability "Configuration"
+        capability "Refresh"
+        capability "Initialize"
+        capability "Battery"
 
-            attribute "lastCheckin", "string"
-            attribute "driverVersion", "string"
+        // NOTE: "SignalStrength" intentionally not declared.
+        // This driver does not currently emit RSSI/LQI events, and BORINGLY-RELIABLE
+        // prefers truthful interfaces over aspirational capabilities.
 
-            fingerprint profileId: "0104",
-                    manufacturer: "_TZ3000_wkai4ga5",
-                    model: "TS0044",
-                    deviceJoinName: "Tuya TS0044 4-Button Scene Switch"
-        }
+        // Existing
+        attribute "lastCheckin", "string"
+        attribute "driverVersion", "string"
+
+        // Canonical (apps): factual, stable keys
+        attribute "lastRx", "number"                   // epoch ms
+        attribute "lastEvent", "number"                // epoch ms
+        attribute "rxCount", "number"
+        attribute "eventCount", "number"
+        attribute "parseErrorCount", "number"
+        attribute "lastParseError", "string"
+        attribute "stuckDownClearCount", "number"
+        attribute "lastRecovery", "number"             // epoch ms
+        attribute "lastButton", "number"
+        attribute "lastAction", "string"
+        attribute "lastEndpoint", "string"
+        attribute "lastZcl", "string"
+
+        // Human-centric (UI): formatting only; do not use for automation logic
+        attribute "uiLastMessageReceived", "string"
+        attribute "uiLastButtonActivity", "string"
+        attribute "uiMessagesReceived", "string"
+        attribute "uiButtonEventsEmitted", "string"
+        attribute "uiLastInteraction", "string"
+        attribute "uiLastZigbeeDetail", "string"
+        attribute "uiIssuesSummary", "string"
+        attribute "uiRecoverySummary", "string"
+
+        fingerprint profileId: "0104",
+                manufacturer: "_TZ3000_wkai4ga5",
+                model: "TS0044",
+                deviceJoinName: "Tuya TS0044 4-Button Scene Switch"
+    }
 
     preferences {
         input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
@@ -150,7 +180,25 @@ def initialize() {
     sendEvent(name: "driverVersion", value: DRIVER_VER, displayed: false)
 
     sendEvent(name: "numberOfButtons", value: BUTTON_COUNT, displayed: false)
-    sendEvent(name: "supportedButtonValues", value: ["pushed", "held", "released", "doubleTapped"], isStateChange: true, displayed: false)
+    List<String> supported = ["pushed", "doubleTapped"]
+    if (emitHeld != false) supported << "held"
+    if (emitReleased != false) supported << "released"
+    sendEvent(name: "supportedButtonValues", value: supported, isStateChange: true, displayed: false)
+
+    // Initialise canonical counters if missing. Monotonic thereafter.
+    if (state.rxCount == null) state.rxCount = 0L
+    if (state.eventCount == null) state.eventCount = 0L
+    if (state.parseErrorCount == null) state.parseErrorCount = 0L
+    if (state.stuckDownClearCount == null) state.stuckDownClearCount = 0L
+
+    // Mirror canonical counters into attributes for apps/UI.
+    sendEvent(name: "rxCount", value: (state.rxCount as Long), displayed: false)
+    sendEvent(name: "eventCount", value: (state.eventCount as Long), displayed: false)
+    sendEvent(name: "parseErrorCount", value: (state.parseErrorCount as Long), displayed: false)
+    sendEvent(name: "stuckDownClearCount", value: (state.stuckDownClearCount as Long), displayed: false)
+
+    // UI summaries (formatting only)
+    refreshUiSummaries()
 
     (1..BUTTON_COUNT).each { Integer b ->
         clearDownState(b)
@@ -198,13 +246,18 @@ def parse(String description) {
     if (logEnable) log.debug "parse: ${description}"
     touchCheckin()
 
-    // v0.5: opportunistic self-heal (fast, bounded) to recover if scheduler delays occur
+    Map descMap = safeDescMap(description)
+    if (!descMap) {
+        noteParseError("Unable to parse Zigbee description")
+        return
+    }
+
+    noteRx(descMap)
+
+    // Change 1/3: Run self-heal after successful parse/noteRx (reduces “surprise clears”)
     if (selfHealOnParse != false) {
         selfHealStuckDown()
     }
-
-    Map descMap = safeDescMap(description)
-    if (!descMap) return
 
     if (handleBattery(descMap)) return
     if (handleTs0044ButtonFrame(descMap)) return
@@ -269,7 +322,9 @@ private boolean handleTs0044ButtonFrame(Map m) {
 
 private boolean handleBattery(Map m) {
     if (m.clusterInt == 0x0001 && m.attrInt == 0x0021 && m.value) {
-        Integer pct = safeHexToInt(m.value?.toString())
+        // Change 2/3: Zigbee 0x0021 is commonly in 0.5% units (200 = 100%)
+        Integer raw = safeHexToInt(m.value?.toString())
+        Integer pct = Math.round(raw / 2.0f) as Integer
         pct = clamp(pct, 1, 100)
         maybeSendBattery(pct)
         return true
@@ -396,6 +451,8 @@ private void hardClearDownState(Integer button, String reason) {
     clearHoldSchedule(button)
     clearHeldEmitted(button)
     bumpSeq(button)
+
+    noteRecovery("Cleared stuck down state (btn ${button}, reason=${reason})")
 }
 
 /* ------------------------- Event emission + debounce ------------------------- */
@@ -413,6 +470,8 @@ private void emitButtonEvent(Integer button, String action) {
 
     logInfo("${device.displayName} button ${button} ${action}")
     sendEvent(name: action, value: button, isStateChange: true, type: "physical")
+
+    noteEvent(button, action)
 }
 
 /* ------------------------- Scheduling ------------------------- */
@@ -472,8 +531,120 @@ private Integer mapButton(Integer b) {
 /* ------------------------- Health / visibility ------------------------- */
 
 private void touchCheckin() {
-    String ts = new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone)
+    String ts = formatNowIso()
     sendEvent(name: "lastCheckin", value: ts, displayed: false)
+}
+
+// Canonical: message received (any successfully parsed Zigbee description)
+private void noteRx(Map m) {
+    Long t = now()
+    state.rxCount = ((state.rxCount ?: 0L) as Long) + 1L
+    sendEvent(name: "lastRx", value: t, displayed: false)
+    sendEvent(name: "rxCount", value: (state.rxCount as Long), displayed: false)
+
+    String ep = (m?.sourceEndpoint != null) ? m.sourceEndpoint.toString() : null
+    String cl = (m?.clusterId != null) ? m.clusterId.toString() : (m?.clusterInt != null ? String.format("%04X", (m.clusterInt as Integer)) : null)
+    String cmd = (m?.command != null) ? m.command.toString() : null
+
+    if (ep) sendEvent(name: "lastEndpoint", value: ep, displayed: false)
+    if (cl || cmd) {
+        String detail = "cluster=${cl ?: "?"} cmd=${cmd ?: "?"}"
+        sendEvent(name: "lastZcl", value: detail, displayed: false)
+    }
+
+    // UI formatting only
+    sendEvent(name: "uiLastMessageReceived", value: formatIso(t), displayed: false)
+    sendEvent(name: "uiMessagesReceived", value: "${state.rxCount as Long}", displayed: false)
+    if (ep || cl || cmd) {
+        String uiDetail = "ep ${ep ?: "?"} | cluster ${cl ?: "?"} | cmd ${cmd ?: "?"}"
+        sendEvent(name: "uiLastZigbeeDetail", value: uiDetail, displayed: false)
+    }
+
+    refreshUiSummaries()
+}
+
+// Canonical: button event emitted
+private void noteEvent(Integer button, String action) {
+    Long t = now()
+    state.eventCount = ((state.eventCount ?: 0L) as Long) + 1L
+
+    sendEvent(name: "lastEvent", value: t, displayed: false)
+    sendEvent(name: "eventCount", value: (state.eventCount as Long), displayed: false)
+    sendEvent(name: "lastButton", value: (button ?: 0) as Integer, displayed: false)
+    sendEvent(name: "lastAction", value: (action ?: ""), displayed: false)
+
+    // UI formatting only
+    sendEvent(name: "uiLastButtonActivity", value: formatIso(t), displayed: false)
+    sendEvent(name: "uiButtonEventsEmitted", value: "${state.eventCount as Long}", displayed: false)
+    sendEvent(name: "uiLastInteraction", value: "Button ${button} — ${action}", displayed: false)
+
+    refreshUiSummaries()
+}
+
+// Canonical: parse issues
+private void noteParseError(String msg) {
+    state.parseErrorCount = ((state.parseErrorCount ?: 0L) as Long) + 1L
+    sendEvent(name: "parseErrorCount", value: (state.parseErrorCount as Long), displayed: false)
+    if (msg) sendEvent(name: "lastParseError", value: msg.take(200), displayed: false)
+    refreshUiSummaries()
+}
+
+// Canonical: recovery actions (bounded self-heal / timeout clearing)
+private void noteRecovery(String reason) {
+    Long t = now()
+    state.stuckDownClearCount = ((state.stuckDownClearCount ?: 0L) as Long) + 1L
+    sendEvent(name: "stuckDownClearCount", value: (state.stuckDownClearCount as Long), displayed: false)
+    sendEvent(name: "lastRecovery", value: t, displayed: false)
+
+    // UI formatting only
+    sendEvent(name: "uiRecoverySummary", value: "${state.stuckDownClearCount as Long} (last: ${formatIso(t)})", displayed: false)
+    if (reason) {
+        refreshUiSummaries(reason.take(120))
+    } else {
+        refreshUiSummaries()
+    }
+}
+
+// UI summaries are formatting only and may change without breaking app contracts.
+private void refreshUiSummaries(String extraNote = null) {
+    Long pe = (state.parseErrorCount ?: 0L) as Long
+    Long rc = (state.stuckDownClearCount ?: 0L) as Long
+    String lastErr = device.currentValue("lastParseError") as String
+
+    List<String> parts = []
+    if (pe > 0) parts << "parse issues: ${pe}" + (lastErr ? " (last: ${lastErr})" : "")
+    if (rc > 0) parts << "recoveries: ${rc}"
+    if (extraNote) parts << extraNote
+
+    String issues = parts ? parts.join(" | ") : "none recorded"
+    sendEvent(name: "uiIssuesSummary", value: issues, displayed: false)
+
+    // Keep recovery summary populated even when zero.
+    if (rc <= 0L) {
+        sendEvent(name: "uiRecoverySummary", value: "0", displayed: false)
+    }
+}
+
+// Change 3/3: Timezone fallback to UTC if location.timeZone is null
+private java.util.TimeZone tzOrUtc() {
+    return location?.timeZone ?: java.util.TimeZone.getTimeZone("UTC")
+}
+
+private String formatIso(Long ms) {
+    if (ms == null || ms <= 0L) return ""
+    try {
+        return new Date(ms).format("yyyy-MM-dd HH:mm:ss", tzOrUtc())
+    } catch (Throwable ignored) {
+        return new Date(ms).toString()
+    }
+}
+
+private String formatNowIso() {
+    try {
+        return new Date().format("yyyy-MM-dd HH:mm:ss", tzOrUtc())
+    } catch (Throwable ignored) {
+        return new Date().toString()
+    }
 }
 
 /* ------------------------- Battery ------------------------- */
@@ -512,11 +683,11 @@ private boolean seqMatches(Integer b, Long seq) {
 
 /* ------------------------- State helpers ------------------------- */
 
-private String downKey(Integer b)                  { return "isDown_${b}" }
-private String heldKey(Integer b)                  { return "heldEmitted_${b}" }
-private String holdScheduledKey(Integer b)         { return "holdScheduled_${b}" }
+private String downKey(Integer b)                    { return "isDown_${b}" }
+private String heldKey(Integer b)                    { return "heldEmitted_${b}" }
+private String holdScheduledKey(Integer b)           { return "holdScheduled_${b}" }
 private String debounceKey(Integer b, String action) { return "db_${b}_${action}" }
-private String downSinceKey(Integer b)             { return "downSinceMs_${b}" }
+private String downSinceKey(Integer b)               { return "downSinceMs_${b}" }
 
 private boolean isDown(Integer b) { return (state[downKey(b)] == true) }
 private void setDownState(Integer b, boolean v) { state[downKey(b)] = v }
