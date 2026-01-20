@@ -2,7 +2,9 @@
 
 - **Version:** 1.1.0  
 - **Platform:** Hubitat Elevation  
-- **Namespace:** EMC  
+- **Namespace:** EMC
+- **Latest release:** v1.1.0  
+  https://github.com/EMChavits/hubitat-tuya-ts0044-driver/releases/latest
 
 A reliability-focused custom driver for **Tuya TS0044-based 4-button Zigbee scene switches**, developed and validated through real-world use rather than optimistic assumptions.
 
