@@ -1,4 +1,4 @@
-# Tuya TS0044 4-Button Zigbee Scene Switch (Reliable) — Hubitat Driver
+# Tuya TS0044 4-Button Zigbee Scene Switch (Reliable) - Hubitat Driver
 
 - **Version:** 1.1.0  
 - **Platform:** Hubitat Elevation  
